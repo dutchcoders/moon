@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,14 +21,23 @@ import (
 type Moon struct {
 	outChan chan Print
 	errChan chan Print
+
+	startedChan  chan string
+	finishedChan chan string
 }
 
 func (m *Moon) run(name, command string) {
 	var err error
 	defer func() {
-		if err != nil {
-			// use errchan for this?
-			fmt.Printf("Error occured: %s\n", err)
+		m.finishedChan <- name
+
+		if err == nil {
+			return
+		}
+
+		m.errChan <- Print{
+			Host: "",
+			Line: fmt.Sprintf("Error occured: %s\n", err),
 		}
 	}()
 
@@ -52,6 +62,8 @@ func (m *Moon) run(name, command string) {
 		err = fmt.Errorf("Error occured during start: %s\n", err.Error())
 		return
 	}
+
+	m.startedChan <- name
 
 	go func() {
 		r := bufio.NewReader(stdout)
@@ -88,6 +100,8 @@ func (m *Moon) run(name, command string) {
 			}
 		}
 	}()
+
+	cmd.Wait()
 }
 
 func kill(process *os.Process) error {
@@ -118,8 +132,10 @@ func kill(process *os.Process) error {
 
 func New() *Moon {
 	return &Moon{
-		outChan: make(chan Print),
-		errChan: make(chan Print),
+		outChan:      make(chan Print),
+		startedChan:  make(chan string),
+		finishedChan: make(chan string),
+		errChan:      make(chan Print),
 	}
 }
 
@@ -135,6 +151,8 @@ func main() {
 
 	defer a.EnableCursor()
 
+	writeToFile := ""
+
 	plus := []*regexp.Regexp{}
 	minus := []*regexp.Regexp{}
 	highlights := []*regexp.Regexp{}
@@ -144,6 +162,16 @@ func main() {
 		highlight := false
 
 		arg := os.Args[i]
+
+		if arg == "-f" {
+			i++
+
+			arg = os.Args[i]
+
+			writeToFile = arg
+			continue
+		}
+
 		if arg == "-v" {
 			// negative
 			i++
@@ -171,6 +199,20 @@ func main() {
 		} else {
 			plus = append(plus, r)
 		}
+	}
+
+	var w io.Writer = bufio.NewWriter(ioutil.Discard)
+
+	if writeToFile == "" {
+	} else if f, err := os.OpenFile(writeToFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err != nil {
+		fmt.Println(err.Error())
+		return
+	} else {
+		w2 := bufio.NewWriter(f)
+
+		defer w2.Flush()
+
+		w = f
 	}
 
 	m := New()
@@ -210,6 +252,9 @@ func main() {
 				}
 
 				fmt.Printf(String("%{color:2;hiyellow;bg-blue}%{host}%{color:reset} %{time:15:04:05.000}  ▶ %{message}", Message(s.Line), Host(s.Host)))
+			}
+
+			banner := func() {
 				fmt.Printf("\033[64;44mMoon ▶ running (%d) ▶ \033[0m", numproc)
 
 				d := time.Now().Format("15:04:05")
@@ -220,10 +265,27 @@ func main() {
 			}
 
 			select {
+			case s := <-m.startedChan:
+				numproc++
+				fmt.Printf("\033[2K")
+				fmt.Printf("\033[999D")
+				fmt.Printf(String("%{color:2;hiyellow;bg-blue}%{host}%{color:reset} %{time:15:04:05.000}  ▶ %{message}\n", Message("started"), Host(s)))
+				banner()
+			case s := <-m.finishedChan:
+				// time process duration
+				numproc--
+				fmt.Printf("\033[2K")
+				fmt.Printf("\033[999D")
+				fmt.Printf(String("%{color:2;hiyellow;bg-blue}%{host}%{color:reset} %{time:15:04:05.000}  ▶ %{message}\n", Message("finished"), Host(s)))
+				banner()
 			case s := <-m.outChan:
 				print(s)
+				fmt.Fprintf(w, String("%{host} %{time:15:04:05.000}  ▶ %{message}", Message(s.Line), Host(s.Host)))
+				banner()
 			case s := <-m.errChan:
 				print(s)
+				fmt.Fprintf(w, String("%{host} %{time:15:04:05.000}  ▶ %{message}", Message(s.Line), Host(s.Host)))
+				banner()
 			}
 		}
 	}()
@@ -243,11 +305,18 @@ func main() {
 		for scanner.Scan() {
 			s := scanner.Text()
 
+			s = strings.TrimSpace(s)
+
+			if strings.HasPrefix(s, "#") {
+				continue
+			}
+
+			if s == "" {
+				continue
+			}
 			// we want to sync on all processes to start, to return errors. If all started then start processing
 			parts := strings.Split(s, ",")
 			fmt.Fprintln(os.Stderr, color2.YellowString("Starting (%s): %+v", parts[0], parts[1:]))
-
-			numproc++
 
 			go m.run(parts[0], parts[1])
 		}
